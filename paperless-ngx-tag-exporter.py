@@ -258,24 +258,37 @@ def export_documents_by_tag(tag_from_ini, tag_id, tag_dict, documents, url, head
             document_data.append(row)
         except Exception as e:
             print(f"Failed to export document {doc['id']} ({doc['title']}): {e}")
+        # Excel exportieren
+        filename = f"export-{tag_from_ini}-{datetime.now().strftime('%Y%m%d')}.xlsx"
+        fullfilename = os.path.join(tag_directory, filename)
 
-    # Excel exportieren
-    filename = f"export-{tag_from_ini}-{datetime.now().strftime('%Y%m%d')}.xls"
-    fullfilename = os.path.join(tag_directory, filename)
+        # Pandas DataFrame aus document_data erstellen
+        df = pd.DataFrame(document_data)
 
-    df = pd.DataFrame(document_data)
-    with pd.ExcelWriter(fullfilename, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Dokumentenliste")
-        worksheet = writer.sheets["Dokumentenliste"]
-        header_font = Font(bold=True, color="FFFFFF", name="Arial")
-        fill = PatternFill(start_color="4F81BD",
-                           end_color="4F81BD", fill_type="solid")
+        with pd.ExcelWriter(fullfilename, engine="openpyxl") as writer:
+        # DataFrame in Excel schreiben
+            df.to_excel(writer, index=False, sheet_name="Dokumentenliste")
+            worksheet = writer.sheets["Dokumentenliste"]
 
-     # Kopfzeile formatieren
-        for cell in worksheet[1]:
-            cell.font = header_font
-            cell.fill = fill
+        # Kopfzeile formatieren
+            header_font = Font(bold=True, color="FFFFFF", name="Arial")
+            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            for cell in worksheet[1]:  # Erste Zeile (Kopfzeile)
+                cell.font = header_font
+                cell.fill = header_fill
 
+        # Bedingte Formatierung für ungerade Zeilen
+            light_blue_fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+            formula = "MOD(ROW(),2)=1"  # Formel für ungerade Zeilen
+            rule = FormulaRule(formula=[formula], fill=light_blue_fill)
+
+        # Bereich für die Formatierung festlegen (Datenzeilen)
+            start_column = worksheet.min_column
+            end_column = worksheet.max_column
+            start_row = 2  # Überspringe Kopfzeile
+            end_row = worksheet.max_row
+            range_string = f"{worksheet.cell(row=start_row, column=start_column).coordinate}:{worksheet.cell(row=end_row, column=end_column).coordinate}"
+            worksheet.conditional_formatting.add(range_string, rule)
     print(f"\nExcel-Datei erfolgreich erstellt: {fullfilename}")
 
 def parse_date(date_string):
