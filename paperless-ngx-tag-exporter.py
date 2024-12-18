@@ -12,6 +12,7 @@ import inspect
 from datetime import datetime
 import shutil
 from openpyxl.styles import Font, PatternFill
+from openpyxl.formatting.rule import FormulaRule
 import locale
 
 # Setzt das locale-Systemformat, abhängig von Systemeinstellungen
@@ -245,7 +246,6 @@ def export_documents_by_tag(tag_from_ini, tag_id, tag_dict, documents, url, head
                               for tag_id in doc.get("tags", [])),
             **custom_fields
         }
-        document_data.append(row)
         # PDF und JSON für jedes Dokument speichern
 #        export_pdf(doc['id'], doc['title'], tag_directory, url, headers)
 #        export_json(detailed_doc, doc['title'], tag_directory)
