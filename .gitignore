@@ -1,7 +1,3 @@
-/__thisNumberOfFile_2024-11-29__I_0__V_0.log
+/__thisNumberOfFile_*.log
 /exports
-/launch.json
-/my.ini
-/node_modules
-/package-lock.json
-/package.json
+/paperless-ngx-exporter.ufe.ini

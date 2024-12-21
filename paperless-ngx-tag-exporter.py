@@ -58,15 +58,23 @@ def get_script_name():
     return os.path.splitext(os.path.basename(sys.argv[0]))[0]
 
 def load_config_from_script():
-    """Load the configuration from the ini file with the same name as the script."""
+    """Load the configuration from the ini file with a priority for the .ufe.ini file."""
     script_name = get_script_name()
+    ufe_ini_path = f"{script_name}.ufe.ini"
     ini_path = f"{script_name}.ini"
-    if os.path.exists(ini_path):
+
+    # Try to load the .ufe.ini file first
+    if os.path.exists(ufe_ini_path):
+        print_progress(f"Using config file: {ufe_ini_path}")
+        return load_config(ufe_ini_path)
+    # Fallback to the .ini file
+    elif os.path.exists(ini_path):
         print_progress(f"Using config file: {ini_path}")
         return load_config(ini_path)
     else:
-        print(f"Configuration file '{ini_path}' not found.")
+        print(f"Configuration files '{ufe_ini_path}' and '{ini_path}' not found.")
         sys.exit(1)
+
 
 # ---------------------- Logging ----------------------
 def log_message(log_path, message):
@@ -328,7 +336,7 @@ def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_f
         export_json(detailed_doc, doc['title'], tag_dir)
         document_data.append(row)
 
-    excel_file = os.path.join(tag_dir, f"{tag_name}-{datetime.now().strftime('%Y%m%d')}.xlsx")
+    excel_file = os.path.join(tag_dir, f"__{tag_name}-{datetime.now().strftime('%Y%m%d')}.xlsx")
     export_to_excel(document_data, excel_file, script_name, tag_name, api_url=url, custom_fields_map=custom_fields_map, currency_columns=currency_columns)
     log_message(log_file, f"Tag: {tag_name}, Documents exported: {len(document_data)}")
     print(f"Exported Excel file: {excel_file}")
@@ -424,7 +432,7 @@ def prepare_tag_directory_for_export(tag_name, tag_dir):
     # Format der ZIP-Datei: Tagname + Datum
     zip_filename = os.path.join(
         tag_dir,
-        f"{tag_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        f"__{tag_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     )
     
     # ZIP-Datei erstellen
