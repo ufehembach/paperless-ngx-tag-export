@@ -12,4 +12,4 @@ also the table will be formatedd a little bit SAP like (alternating rows have a 
 the id in the first column is also a link to the document in paperless web gui.
 
 good luck with it.
-this was a quick hack with ChatGPT, neede for my tax exports
+this was a quick hack with ChatGPT, needed for my tax exports
