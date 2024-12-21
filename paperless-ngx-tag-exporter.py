@@ -1,76 +1,247 @@
 #!/usr/bin/env python3
 
 import os
+import sys
+import pwd
 import requests
 import pandas as pd
+import inspect
 import argparse
 from configparser import ConfigParser
 from tqdm import tqdm
 import json
-import sys
-import inspect
 from datetime import datetime
-import shutil
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Font, PatternFill
 from openpyxl.formatting.rule import FormulaRule
+from openpyxl.utils.dataframe import dataframe_to_rows
 import locale
+import re
+import zipfile
+from datetime import datetime
 
-# Setzt das locale-Systemformat, abhängig von Systemeinstellungen
-locale.setlocale(locale.LC_ALL, '')
-
-# Konfiguration und Einstellungen
-
-def load_config(config_path):
-    """Lädt die Konfigurationsdatei."""
-    config = ConfigParser()
-    config.read(config_path)
-    return config
-
-# Funktion zur Ausgabe des Fortschritts in einer einzigen Zeile
+locale.setlocale(locale.LC_ALL, '')  # Set locale based on system settings
 
 def print_progress(message: str):
     frame = inspect.currentframe().f_back
     filename = os.path.basename(frame.f_code.co_filename)
     line_number = frame.f_lineno
     function_name = frame.f_code.co_name
+
     progress_message = f"{filename}:{line_number} [{function_name}] {message}"
+
+    if not hasattr(print_progress, "_last_length"):
+        print_progress._last_length = 0
+
+    clear_space = max(print_progress._last_length - len(progress_message), 0)
+    progress_message += " " * clear_space
+
     sys.stdout.write(f"\r{progress_message}")
     sys.stdout.flush()
 
+    print_progress._last_length = len(progress_message)
+
+# ---------------------- Configuration Loading ----------------------
+def load_config(config_path):
+    """Load configuration file."""
+    print_progress("process...")
+    config = ConfigParser()
+    config.read(config_path)
+    return config
+
+def get_script_name():
+    """Return the name of the current script without extension."""
+    return os.path.splitext(os.path.basename(sys.argv[0]))[0]
+
+def load_config_from_script():
+    """Load the configuration from the ini file with the same name as the script."""
+    script_name = get_script_name()
+    ini_path = f"{script_name}.ini"
+    if os.path.exists(ini_path):
+        print_progress(f"Using config file: {ini_path}")
+        return load_config(ini_path)
+    else:
+        print(f"Configuration file '{ini_path}' not found.")
+        sys.exit(1)
+
+# ---------------------- Logging ----------------------
+def log_message(log_path, message):
+    """Append a log message to the log file."""
+    with open(log_path, "a") as log_file:
+        log_file.write(f"{datetime.now()} - {message}\n")
+
+# ---------------------- API Helpers ----------------------
+def fetch_data(url, headers, endpoint):
+    """Fetch data from API with pagination."""
+    print_progress(message=f"process {endpoint}...")
+    data = []
+    page = 1
+    while True:
+        response = requests.get(f"{url}/{endpoint}/?page={page}", headers=headers)
+
+        if response.status_code != 200:
+            print(f"Error fetching {endpoint}. HTTP {response.status_code}: {response.text}")
+            raise Exception(f"Failed to fetch data from {endpoint}, status code: {response.status_code}")
+
+        try:
+            response_data = response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print(f"JSON decoding error for {endpoint}: {e}")
+            print(f"Response content: {response.text}")
+            raise
+
+        data.extend(response_data.get("results", []))
+        if not response_data.get("next"):
+            break
+        page += 1
+        print_progress(message=f"process {endpoint}/{page}...")
+    return data
+
 def get_name_from_id(url, headers, endpoint, id):
+    """Get name from ID using API."""
     response = requests.get(f"{url}/{endpoint}/{id}/", headers=headers)
     if response.status_code == 200:
         return response.json().get("name", "")
-    return "Unbekannt"
+    return "Unknown"
 
-# Funktion zum Abrufen aller Dokumente
+# ---------------------- Document Export Helpers ----------------------
+def export_pdf(doc_id, doc_title, tag_directory, url, headers):
+    """Export a document's PDF."""
+    sanitized_title = sanitize_filename(doc_title)
+    pdf_path = os.path.join(tag_directory, f"{sanitized_title}.pdf")
+    response = requests.get(f"{url}/documents/{doc_id}/download/", headers=headers)
+    if response.status_code == 200:
+        with open(pdf_path, "wb") as pdf_file:
+            pdf_file.write(response.content)
+    else:
+        print(f"Failed to download PDF for {doc_title}")
 
-def get_all_documents(url, headers):
-    """Holt alle Dokumente von der API ab."""
-    documents = []
-    page = 1
-    while True:
-        response = requests.get(
-            f"{url}/documents/?page_size=25&page={page}", headers=headers)
-        if response.status_code != 200:
-            print(
-                f"Fehler beim Abrufen der Dokumente. Status Code: {response.status_code}")
-            break
+def sanitize_filename(filename):
+    """
+    Remove or replace characters in the filename that are not allowed in file names.
+    """
+    sanitized = re.sub(r'[<>:"/\\|?*]', '-', filename)  # Ersetze verbotene Zeichen durch '-'
+    return sanitized[:255]  # Truncate to avoid overly long filenames
 
-        data = response.json()
-        documents.extend(data["results"])
-        if not data["next"]:
-            break
-        page += 1
-    return documents
+def export_json(doc_data, doc_title, tag_directory):
+    """Export a document's metadata as JSON."""
+    sanitized_title = sanitize_filename(doc_title)
+    json_path = os.path.join(tag_directory, f"{sanitized_title}.json")
+    with open(json_path, "w", encoding="utf-8") as json_file:
+        json.dump(doc_data, json_file, ensure_ascii=False, indent=4)
 
-# Funktion zum Abrufen der Custom-Field-Definitionen und Mapping erstellen
+# ---------------------- Excel Export Helpers ----------------------
+def export_to_excel(data, file_path, script_name, tag_name, api_url, custom_fields_map,currency_columns):
+    import pandas as pd
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime
+    import os
+    import pwd
+
+    # API-Basis-URL ohne `/api` generieren
+    base_url = api_url.rstrip("/api")
+
+    # Ordnerpfad aus file_path extrahieren
+    directory = os.path.dirname(file_path)
+
+    # Dateiname vorbereiten
+    base_filename = f"export-{tag_name}-{datetime.now().strftime('%Y%m%d')}"
+    file_ext = ".xlsx"
+    filename = f"{base_filename}{file_ext}"
+    fullfilename = os.path.join(directory, filename)
+
+    # Falls Datei bereits geöffnet oder existiert, iterativ neuen Namen finden
+    counter = 1
+    while os.path.exists(fullfilename):
+        filename = f"{base_filename}-{counter}{file_ext}"
+        fullfilename = os.path.join(directory, filename)
+        counter += 1
+
+    # Pandas DataFrame aus document_data erstellen
+    df = pd.DataFrame(data)
+
+
+    with pd.ExcelWriter(fullfilename, engine="openpyxl") as writer:
+        # DataFrame in Excel schreiben (ab Zeile 3 für Daten)
+        df.to_excel(writer, index=False, startrow=2, sheet_name="Dokumentenliste")
+        worksheet = writer.sheets["Dokumentenliste"]
+
+        # Headerzeile (A1) mit Scriptnamen, Tag und anderen Infos
+        header_info = f"{script_name} -- {tag_name} -- {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} -- {pwd.getpwuid(os.getuid()).pw_name} -- {os.uname().nodename}"
+        worksheet["A1"] = header_info
+        worksheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(df.columns))  # Header über alle Spalten
+        header_font = Font(bold=True, color="FFFFFF", name="Arial")
+        header_fill = PatternFill(start_color="002060", end_color="002060", fill_type="solid")  # Dunkelblau
+        worksheet["A1"].font = header_font
+        worksheet["A1"].fill = header_fill
+
+        # Summenzeilen für Currency-Spalten in Zeile 2
+        for column_name in currency_columns:
+            if column_name in df.columns:
+                col_idx = df.columns.get_loc(column_name) + 1  # Excel-Spaltenindex
+                start_cell = worksheet.cell(row=4, column=col_idx).coordinate
+                end_cell = worksheet.cell(row=worksheet.max_row, column=col_idx).coordinate
+                sum_formula = f"=SUM({start_cell}:{end_cell})"
+                sum_cell = worksheet.cell(row=2, column=col_idx)
+                sum_cell.value = sum_formula
+                sum_cell.font = Font(bold=True)
+
+        # Spaltentitel (Zeile 3)
+        header_row = worksheet[3]
+        for cell in header_row:
+            cell.font = Font(bold=True, color="FFFFFF", name="Arial")
+            cell.fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+
+        # Autofilter
+        worksheet.auto_filter.ref = f"A3:{worksheet.cell(row=3, column=len(df.columns)).coordinate}"
+
+        # Datenformatierung mit alternierenden Farben
+        light_blue_fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
+        formula = "MOD(ROW(),2)=0"
+        range_string = f"A4:{worksheet.cell(row=worksheet.max_row, column=len(df.columns)).coordinate}"
+        worksheet.conditional_formatting.add(range_string, FormulaRule([formula], light_blue_fill))
+
+        # Hyperlinks in der ID-Spalte
+        # Suche die Spalte basierend auf dem Header in Zeile 3
+        document_column = "ID"  # Der Header-Name für die Spalte mit den Dokument-IDs
+        id_column_idx = None
+        for col_idx, cell in enumerate(worksheet[3], start=1):  # Zeile 3 ist der Header
+            if cell.value == document_column:
+                id_column_idx = col_idx
+                break
+
+        # Dokument-ID in URLs umwandeln
+        if id_column_idx:  # Wenn die Spalte mit der ID gefunden wurde
+            for row_idx in range(4, worksheet.max_row + 1):  # Daten beginnen in Zeile 4
+                doc_id = worksheet.cell(row=row_idx, column=id_column_idx).value
+                if doc_id:  # Nur wenn ein Wert vorhanden ist
+                    link_formula = f'=HYPERLINK("{base_url}/documents/{doc_id}/details", "{doc_id}")'
+                    worksheet.cell(row=row_idx, column=id_column_idx).value = link_formula
+
+        # Schriftart-Objekt definieren
+        default_font = Font(name="Arial")
+
+        # Alle Zellen formatieren
+        for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+            for cell in row:
+                cell.font = default_font
+
+
+    print(f"\nExcel-Datei erfolgreich erstellt: {fullfilename}")
+ 
+
 
 def get_custom_field_definitions(url, headers):
     """Holt die Definitionen für Custom Fields und erzeugt Mappings für Namen, Typ und Auswahloptionen."""
-    print( "Custom Fields")
-    custom_fields_response = requests.get(
-        f"{url}/custom_fields/", headers=headers)
+    print_progress(message=f"process custom fields...")
+    custom_fields_response = requests.get(f"{url}/custom_fields/", headers=headers)
     custom_fields_map = {}
     custom_field_choices_map = {}
 
@@ -80,159 +251,60 @@ def get_custom_field_definitions(url, headers):
             for field in custom_fields_data["results"]:
                 field_id = field["id"]
                 field_name = field["name"]
+                print_progress(message=f"process {field_name}...")
+
                 field_type = field["data_type"]
 
                 # Speichern der Felddefinitionen im custom_fields_map
                 custom_fields_map[field_id] = {
                     "name": field_name,
                     "type": field_type,
-                    "choices": []
+                    "choices": {}
                 }
 
                 # Wenn es Auswahloptionen gibt, speichern wir sie
                 if field_type == "select":
-                    # Wir nehmen hier nur die ersten 5 Optionen als Beispiel,
-                    # Du kannst die Anzahl anpassen oder nach Bedarf gestalten
                     custom_field_choices_map[field_id] = {
                         idx: option for idx, option in enumerate(field["extra_data"]["select_options"])
                     }
                     # Füge die Optionen dem custom_fields_map hinzu
                     custom_fields_map[field_id]["choices"] = custom_field_choices_map[field_id]
         except json.decoder.JSONDecodeError as e:
-            print_progress(
-                f"JSON-Dekodierungsfehler beim Abrufen der Custom Fields: {e}")
+            print(f"JSON-Dekodierungsfehler beim Abrufen der Custom Fields: {e}")
             exit()
     else:
-        print_progress(
-            f"Fehler beim Abrufen der Custom Fields. Status Code: {custom_fields_response.status_code}")
+        print(f"Fehler beim Abrufen der Custom Fields. Status Code: {custom_fields_response.status_code}")
         exit()
 
     return custom_fields_map
 
-def export_pdf(doc_id, doc_title, tag_directory, url, headers):
-    """Lädt das PDF eines Dokuments herunter und speichert es im angegebenen Verzeichnis."""
-    pdf_path = os.path.join(tag_directory, f"{doc_title}.pdf")
-    pdf_response = requests.get(
-        f"{url}/documents/{doc_id}/download/", headers=headers)
-    if pdf_response.status_code == 200:
-        with open(pdf_path, "wb") as pdf_file:
-            pdf_file.write(pdf_response.content)
-    else:
-        print(f"Fehler beim Herunterladen der PDF für Dokument {doc_title}")
 
-def export_json(doc_data, doc_title, tag_directory):
-    """Speichert die Metadaten eines Dokuments als JSON im angegebenen Verzeichnis."""
-    json_path = os.path.join(tag_directory, f"{doc_title}.json")
-    with open(json_path, "w", encoding="utf-8") as json_file:
-        json.dump(doc_data, json_file, ensure_ascii=False, indent=4)
-    # print(f"JSON für Dokument {doc_title} gespeichert unter {json_path}")
 
-# Hauptfunktion
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Paperless-ngx Dokumentexporter.")
-    parser.add_argument("-c", "--config", default="my.ini",
-                        help="Pfad zur Konfigurationsdatei")
-    args = parser.parse_args()
+# ---------------------- Main Export Logic ----------------------
 
-    # Konfiguration laden
-    config = load_config(args.config)
-    url = config['paperless']['url']
-    token = config['paperless']['token']
-    export_directory = config['paperless']['export_directory']
-    tag_from_ini = config['paperless']['tags']
-    headers = {"Authorization": f"Token {token}"}
 
-    # Custom-Field-Definitionen laden
-    print_progress("Lade Custom-Field-Definitionen")
-    custom_fields_map = get_custom_field_definitions(
-        url, headers)
+def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_fields_map, export_directory, log_file, tag_dict, script_name, is_all_docs=False):
+    """Process and export documents by tag or all documents."""
+    tag_dir = os.path.join(export_directory, f"{tag_name}")
+    os.makedirs(tag_dir, exist_ok=True)
 
-    # Abrufen der Tags
-    print_progress("Lade Tags")
-    tags_response = requests.get(f"{url}/tags/", headers=headers)
-
-    # Überprüfen, ob die Anfrage erfolgreich war
-    if tags_response.status_code == 200:
-       # Tag-Daten extrahieren und in ein Dictionary umwandeln
-       tag_dict = {tag["id"]: tag["name"] for tag in tags_response.json()["results"]}
-
-        # Tags direkt ausgeben
-       #print("Tags:")
-        #for tag_id, tag_name in tag_dict.items():
-        #    print(f"ID: {tag_id}, Name: {tag_name}")
-    else:
-       print(f"Fehler beim Abrufen der Tags: {tags_response.status_code} - {tags_response.text}")
-
-    # Beispiel für einen Tag
-    tag_id = next((tid for tid, tname in tag_dict.items()
-                  if tname.lower() == tag_from_ini.lower()), None)
-    if not tag_id:
-        print(f"Tag '{tag_from_ini}' nicht gefunden.")
-        exit()
-
-    # Dokumente für Tag abrufen
-    documents = get_all_documents(url, headers)
-   # Exportieren in Excel
-    export_documents_by_tag(tag_from_ini, tag_id, tag_dict, documents, url, headers,
-                            custom_fields_map, export_directory)
-
-# Funktion zur Bestimmung der Terminalbreite
-
-def get_terminal_width():
-    return os.get_terminal_size().columns
-
-# Exportieren in Excel
-def export_documents_by_tag(tag_from_ini, tag_id, tag_dict, documents, url, headers, custom_fields_map, export_directory):
-    """Exportiert Dokumente für einen bestimmten Tag in eine Excel-Datei."""
-    # Verzeichnis erstellen und alte Dateien löschen
-    tag_directory = os.path.join(export_directory, f"export-{tag_from_ini}")
-    if os.path.exists(tag_directory):
-        for f in os.listdir(tag_directory):
-            os.remove(os.path.join(tag_directory, f))
-    else:
-        os.makedirs(tag_directory)
-
-    # Daten für Excel vorbereiten
-# In deinem Code
-    terminal_width = get_terminal_width()  # Hole die Breite des Terminals
     document_data = []
+    currency_columns = []  # Liste zur Speicherung aller Currency-Felder
+    custom_fields = {}
 
-# Beispiel für die Verwendung von tqdm
-    for doc in tqdm(documents, desc=f"Verarbeite Dokumente für Tag '{tag_from_ini}'", unit="Dok", ncols=terminal_width):
-        if tag_id not in doc.get("tags", []):
+    for doc in tqdm(documents, desc=f"Processing documents for tag '{tag_name}'", unit="doc"):
+        # Wenn 'is_all_docs' True ist, exportiere alle Dokumente, unabhängig vom Tag
+        if not is_all_docs and tag_id not in doc.get("tags", []):
             continue
 
-        # Custom Fields und weitere Felder aufbereiten
-        detailed_doc_response = requests.get(
-            f"{url}/documents/{doc['id']}/", headers=headers)
-        detailed_doc = detailed_doc_response.json()
+        detailed_response = requests.get(f"{url}/documents/{doc['id']}/", headers=headers)
+        detailed_doc = detailed_response.json()
 
-        custom_fields = {}
-        if "custom_fields" in detailed_doc:
-            for custom_field in detailed_doc.get("custom_fields", []):
-                field_id = custom_field["field"]
-                field_info = custom_fields_map.get(field_id, {})
-                field_name = field_info.get(
-                    "name", f"Feld {field_id}")  # Hier den Namen abholen
-                field_type = field_info.get("type", "string")
-                field_value = custom_field["value"]
+        custom_fields, doc_currency_columns = process_custom_fields(custom_fields_map, detailed_doc)
+        currency_columns.extend(doc_currency_columns)  # Speichere Currency-Felder
 
-               # Prüfen, ob der Typ `monetary` ist, um die Währungsformatierung anzuwenden
-                if field_type == "monetary":
-                    formatted_value = format_currency(field_value)
-                    custom_fields[field_name] = formatted_value
-                elif field_type == "select":  # Verwendung von `elif` hier
-                    # Für Auswahlfelder den Namen des Optionswertes abrufen
-                    custom_fields[field_name] = field_info["choices"].get(
-                        field_value, f"Wert {field_value}"
-                    )
-                else:
-                    # Standardbehandlung für andere Typen
-                    custom_fields[field_name] = field_value
-
-        # Excel-Reihen
+        # Dokumentdaten sammeln
         row = {
             "ID": doc.get("id"),
             "Titel": doc.get("title"),
@@ -240,56 +312,85 @@ def export_documents_by_tag(tag_from_ini, tag_id, tag_dict, documents, url, head
             "Dokumenttyp": get_name_from_id(url, headers, "document_types", doc.get("document_type")),
             "Speicherpfad": get_name_from_id(url, headers, "storage_paths", doc.get("storage_path")),
             "Tags": ", ".join(tag_dict.get(tag_id, f"Tag {tag_id}") for tag_id in doc.get("tags", [])),
-            # Beispiel für das Parsen des Datums mit Zeit und Zeitzoneninformationen
-            "Datum": parse_date(doc.get("created")),  # Verwende die parse_date Funktion hier
-            "Tags": ", ".join(tag_dict.get(tag_id, f"Tag {tag_id}")
-                              for tag_id in doc.get("tags", [])),
-            **custom_fields
+            "ArchivDate": parse_date(doc.get("created")),
+            "ModifyDate": parse_date(doc.get("modified")),
+            "AddedDate": parse_date(doc.get("added")),
+            "Tags": ", ".join(tag_dict.get(tag_id, f"Tag {tag_id}") for tag_id in doc.get("tags", [])),
+            **custom_fields,  
+            "OriginalName": doc.get("original_file_name"),
+            "ArchivedName": doc.get("archived_file_name"),
+            "Owner": doc.get("Owner"),
+            "Notes": doc.get("Notes"),
+            "Seiten": doc.get("page_count"),
         }
-        # PDF und JSON für jedes Dokument speichern
-#        export_pdf(doc['id'], doc['title'], tag_directory, url, headers)
-#        export_json(detailed_doc, doc['title'], tag_directory)
-        try:
-        # Export PDF and JSON
-            export_pdf(doc['id'], doc['title'], tag_directory, url, headers)
-            export_json(detailed_doc, doc['title'], tag_directory)
-        
-            # Append document data to rows for Excel or further processing
-            document_data.append(row)
-        except Exception as e:
-            print(f"Failed to export document {doc['id']} ({doc['title']}): {e}")
-        # Excel exportieren
-        filename = f"export-{tag_from_ini}-{datetime.now().strftime('%Y%m%d')}.xlsx"
-        fullfilename = os.path.join(tag_directory, filename)
 
-        # Pandas DataFrame aus document_data erstellen
-        df = pd.DataFrame(document_data)
+        export_pdf(doc['id'], doc['title'], tag_dir, url, headers)
+        export_json(detailed_doc, doc['title'], tag_dir)
+        document_data.append(row)
 
-        with pd.ExcelWriter(fullfilename, engine="openpyxl") as writer:
-        # DataFrame in Excel schreiben
-            df.to_excel(writer, index=False, sheet_name="Dokumentenliste")
-            worksheet = writer.sheets["Dokumentenliste"]
+    excel_file = os.path.join(tag_dir, f"{tag_name}-{datetime.now().strftime('%Y%m%d')}.xlsx")
+    export_to_excel(document_data, excel_file, script_name, tag_name, api_url=url, custom_fields_map=custom_fields_map, currency_columns=currency_columns)
+    log_message(log_file, f"Tag: {tag_name}, Documents exported: {len(document_data)}")
+    print(f"Exported Excel file: {excel_file}")
 
-        # Kopfzeile formatieren
-            header_font = Font(bold=True, color="FFFFFF", name="Arial")
-            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
-            for cell in worksheet[1]:  # Erste Zeile (Kopfzeile)
-                cell.font = header_font
-                cell.fill = header_fill
+def process_custom_fields(custom_fields_map, detailed_doc):
+    custom_fields = {}
+    currency_fields = []  # Liste zum Speichern der Currency-Feldnamen
 
-        # Bedingte Formatierung für ungerade Zeilen
-            light_blue_fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
-            formula = "MOD(ROW(),2)=1"  # Formel für ungerade Zeilen
-            rule = FormulaRule(formula=[formula], fill=light_blue_fill)
+    if "custom_fields" in detailed_doc:
+        for custom_field in detailed_doc.get("custom_fields", []):
+            field_id = custom_field.get("field")
+            if not field_id:    
+                continue
 
-        # Bereich für die Formatierung festlegen (Datenzeilen)
-            start_column = worksheet.min_column
-            end_column = worksheet.max_column
-            start_row = 2  # Überspringe Kopfzeile
-            end_row = worksheet.max_row
-            range_string = f"{worksheet.cell(row=start_row, column=start_column).coordinate}:{worksheet.cell(row=end_row, column=end_column).coordinate}"
-            worksheet.conditional_formatting.add(range_string, rule)
-    print(f"\nExcel-Datei erfolgreich erstellt: {fullfilename}")
+            field_info = custom_fields_map.get(field_id, {})
+            if not isinstance(field_info, dict):
+                continue
+
+            field_name = field_info.get("name", f"Feld {field_id}")
+            field_type = field_info.get("type", "string")
+            field_value = custom_field.get("value", "")
+
+            if field_type == "monetary":
+                numeric_value = parse_currency(field_value)
+                custom_fields[field_name] = numeric_value  # Rohdaten speichern
+                custom_fields[f"{field_name}_formatted"] = format_currency(field_value)  # Formatierte Version speichern
+                currency_fields.append(field_name)  # Speichern des Currency-Felds
+            elif field_type == "select":
+                if isinstance(field_info.get("choices"), dict):
+                    custom_fields[field_name] = field_info["choices"].get(field_value, f"Wert {field_value}")
+                else:
+                    custom_fields[field_name] = f"Wert {field_value}"
+            else:
+                custom_fields[field_name] = field_value
+
+    return custom_fields, currency_fields
+
+def parse_currency(value):
+    """Parst einen Währungswert wie 'EUR5.00' in einen Float."""
+    try:
+        # Entferne Währungszeichen (alles außer Ziffern, Punkt oder Minus)
+        numeric_part = ''.join(c for c in value if c.isdigit() or c == '.' or c == '-')
+        return float(numeric_part)
+    except Exception as e:
+        # print(f"Fehler beim Parsen des Währungswerts '{value}': {e}")
+        return 0.0  # Fallback auf 0 bei Fehlern
+
+def format_currency(value, currency_locale="de_DE.UTF-8"):
+    if value is None:
+        return ""
+    try:
+        clean_value = ''.join(filter(str.isdigit, value))
+        if not clean_value:
+            return "0,00"
+        value_float = float(clean_value) / 100
+    except ValueError:
+        value_float = 0.0
+
+    locale.setlocale(locale.LC_ALL, currency_locale)
+    formatted_value = locale.currency(value_float, grouping=True)
+    return formatted_value
+
 
 def parse_date(date_string):
     """
@@ -313,91 +414,131 @@ def parse_date(date_string):
             return parsed_date.strftime("%d.%m.%Y")
     return None
 
-
-def export_json(document_data, doc_title, tag_directory):
+def prepare_tag_directory_for_export(tag_name, tag_dir):
     """
-    Export document details as a JSON file.
+    Archiviert alle existierenden Inhalte des Verzeichnisses in einer ZIP-Datei und leert das Verzeichnis.
+    
+    :param tag_name: Name des Tags
+    :param tag_dir: Verzeichnis für den Tag
     """
-    # Sanitize the title to avoid invalid file names
-    sanitized_title = sanitize_filename(doc_title)
+    # Format der ZIP-Datei: Tagname + Datum
+    zip_filename = os.path.join(
+        tag_dir,
+        f"{tag_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    )
     
-    # Build the JSON file path
-    json_path = os.path.join(tag_directory, f"{sanitized_title}.json")
+    # ZIP-Datei erstellen
+    with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(tag_dir):
+            for file in files:
+                if not file.endswith('.zip'):  # Keine existierenden ZIP-Dateien packen
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, tag_dir)  # Relativer Pfad in der ZIP-Datei
+                    zipf.write(file_path, arcname)
     
-    # Ensure the directory exists
-    os.makedirs(tag_directory, exist_ok=True)
-    
-    # Write JSON data to file
-    try:
-        with open(json_path, "w", encoding="utf-8") as json_file:
-            json.dump(document_data, json_file, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"Error exporting JSON for document {doc_title}: {e}")
+    # Verzeichnis leeren (außer ZIP-Dateien)
+    for root, dirs, files in os.walk(tag_dir):
+        for file in files:
+            if not file.endswith('.zip'):  # ZIP-Dateien behalten
+                os.remove(os.path.join(root, file))
+        for dir in dirs:
+            os.rmdir(os.path.join(root, dir))
 
-
-def export_pdf(doc_id, doc_title, tag_directory, url, headers):
+def ensure_directory_exists(directory):
     """
-    Export a PDF for a document.
+    Erstellt das Verzeichnis, falls es nicht existiert.
     """
-    # Sanitize the title to avoid issues with special characters
-    sanitized_title = sanitize_filename(doc_title)
-    
-    # Build the PDF path
-    pdf_path = os.path.join(tag_directory, f"{sanitized_title}.pdf")
-    
-    # Ensure the target directory exists
-    os.makedirs(tag_directory, exist_ok=True)
-    
-    # Simulated PDF writing (replace with actual download logic)
-    try:
-        with open(pdf_path, "wb") as pdf_file:
-            # Here would go the logic to write the PDF file from the request
-            pass  # Replace with actual PDF content logic
-    except Exception as e:
-        print(f"Error exporting PDF for document {doc_id}: {e}")
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
-
-def format_currency(value, currency_locale="de_DE.UTF-8"):
-    """Formatiert eine Währungszahl gemäß der angegebenen Locale."""
-    if value is None:
-        # Log the issue and return an empty string or a default value
-        print("Warning: Received None value in format_currency. Returning empty string.")
-        return ""
-    try:
-        # Entferne den Währungsindikator (z.B. EUR) aus dem Wert
-        # Nur die Ziffern extrahieren
-        clean_value = ''.join(filter(str.isdigit, value))
-        if not clean_value:  # Falls keine Ziffern gefunden werden
-            return "0,00"  # Standardwert, falls kein gültiger Wert vorhanden ist
-
-        # Wandle den bereinigten Wert in einen float um
-        # Angenommen, die Eingabe ist in Cent, daher Division durch 100
-        value_float = float(clean_value) / 100
-    except ValueError:
-        value_float = 0.0  # Standardwert, falls Parsing fehlschlägt
-
-    # Setze die Locale für die Währungsformatierung
-    locale.setlocale(locale.LC_ALL, currency_locale)
-
-    # Formatiere den Wert als Währung
-    formatted_value = locale.currency(value_float, grouping=True)
-    formatted_value = value_float
-    return formatted_value
-
-import re
-
-def sanitize_filename(filename):
+def export_all_documents(tag_name, export_dir, documents, api_url, headers, custom_fields_map, tag_dict, script_name, log_path):
     """
-    Remove or replace characters in the filename that are not allowed in file names.
+    Exportiert alle Dokumente in ein spezielles Verzeichnis für "ALLDocs".
     """
-    sanitized = re.sub(r'[<>:"/\\|?*]', '-', filename)  # Ersetze verbotene Zeichen durch '-'
-    return sanitized[:255]  # Truncate to avoid overly long filenames
+    all_docs_dir = os.path.join(export_dir, tag_name)
+    
+    # Verzeichnis sicherstellen
+    ensure_directory_exists(all_docs_dir)
+    
+    # Vor dem Export Inhalte archivieren und Verzeichnis leeren
+    prepare_tag_directory_for_export(tag_name, all_docs_dir)
+    
+    # Export-Prozess starten
+    log_message(
+        log_path,
+        f"Exportiere alle Dokumente in '{tag_name}'"
+    )
+    process_documents_by_tag(
+        documents, tag_name, None, api_url, headers, custom_fields_map,
+        tag_dict=tag_dict, export_directory=export_dir,
+        script_name=script_name, log_file=log_path
+    )
 
 
-# Beispielaufruf
-#formatted_value = format_currency('EUR22.50')
-#print(formatted_value)  # Gibt "22,50 €" aus
+def export_for_tags(tags, export_dir, documents, api_url, headers, custom_fields_map, tag_dict, script_name, log_path):
+    """
+    Exportiert nur die Tags, für die ein Unterverzeichnis im Export-Verzeichnis existiert.
+    Zusätzlich wird ein Export für 'ALLDocs' durchgeführt, falls gewünscht.
+    """
+    # Export für "ALLDocs"
+    all_docs_tag_name = "ALLDocs"
+    all_docs_tag_id = -1  # Ein Tag-ID für ALLDocs (optional, da es nur einen Export für alle Dokumente macht)
+    
+    # Exportiere alle Dokumente, auch ohne spezifisches Tag
+    log_message(log_path, f"Exportiere alle Dokumente für 'ALLDocs'")
+    process_documents_by_tag(
+        documents, all_docs_tag_name, all_docs_tag_id, api_url, headers, custom_fields_map,
+        export_directory=export_dir, log_file=log_path, tag_dict=tag_dict, script_name=script_name, is_all_docs=True
+    )
+    
+    # Export für die spezifischen Tags
+    for tag in tags:
+        tag_name = tag["name"]
+        tag_id = tag["id"]
+        
+        # Pfad zum Unterverzeichnis für das Tag erstellen
+        tag_dir = os.path.join(export_dir, tag_name)
 
-# Ausführung der Hauptfunktion
+        # Überprüfen, ob das Unterverzeichnis existiert
+        if os.path.isdir(tag_dir):
+            # Vor dem Export: Inhalte archivieren und Verzeichnis leeren
+            prepare_tag_directory_for_export(tag_name, tag_dir)
+            
+            # Dokumente exportieren
+            log_message(log_path, f"Exportiere Dokumente für Tag: {tag_name} (ID: {tag_id})")
+            process_documents_by_tag(
+                documents, tag_name, tag_id, api_url, headers, custom_fields_map,
+                tag_dict=tag_dict, export_directory=export_dir,
+                script_name=script_name, log_file=log_path
+            )
+        else:
+            # Wenn das Verzeichnis nicht existiert, logge eine Nachricht
+            log_message(log_path, f"Verzeichnis für Tag {tag_name} existiert nicht. Export übersprungen.")
+
+
+# ---------------------- Main ----------------------
+def main():
+    script_name = get_script_name()
+    config = load_config_from_script()
+
+    export_dir = config.get("Export", "directory")
+    api_url = config.get("API", "url")
+    api_token = config.get("API", "token")
+    log_path = config.get("Log", "log_file")
+
+    headers = {"Authorization": f"Token {api_token}"}
+
+    log_message(log_path, "Starting export...")
+
+    tags = fetch_data(api_url, headers, "tags")
+    documents = fetch_data(api_url, headers, "documents")
+    #custom_fields_map = {field["id"]: field for field in fetch_data(api_url, headers, "custom_fields")}
+    custom_fields_map = get_custom_field_definitions(url=api_url,headers=headers)
+    tag_dict = {tag["id"]: tag["name"] for tag in tags}
+
+    # Neue Funktion aufrufen, die den Export durchführt
+    export_for_tags(tags, export_dir=export_dir,documents=documents, api_url=api_url, headers=headers, custom_fields_map=custom_fields_map, tag_dict=tag_dict, script_name=script_name,log_path=log_path)
+
 if __name__ == "__main__":
     main()
+
