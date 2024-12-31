@@ -24,6 +24,10 @@ import re
 import zipfile
 from datetime import datetime
 
+# Setze das Arbeitsverzeichnis auf das Verzeichnis, in dem das Skript gespeichert ist
+script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+os.chdir(script_dir)
+
 locale.setlocale(locale.LC_ALL, '')  # Set locale based on system settings
 
 def print_progress(message: str):
@@ -523,6 +527,37 @@ def export_for_tags(tags, export_dir, documents, api_url, headers, custom_fields
             # Wenn das Verzeichnis nicht existiert, logge eine Nachricht
             log_message(log_path, f"Verzeichnis für Tag {tag_name} existiert nicht. Export übersprungen.")
 
+import os
+import shutil
+from datetime import datetime
+
+# Funktion, um den Log-Dateinamen basierend auf dem Skriptnamen und Datum zu erstellen
+def get_log_filename(script_name, log_dir, suffix="progress"):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if suffix == "log":
+        return os.path.join(log_dir, f"__{script_name}__{timestamp}.log")
+    else:
+        return os.path.join(log_dir, f"__{script_name}__{timestamp}.{suffix}.log")
+
+# Funktion, um Logs zu initialisieren
+def initialize_log(log_dir, script_name):
+    final_log_path = get_log_filename(script_name, log_dir, "log")
+    progress_log_path = get_log_filename(script_name, log_dir, "progress")
+    
+    # Falls ein vorheriges Log existiert, es in die neue Log-Datei kopieren
+    if os.path.exists(final_log_path):
+        with open(progress_log_path, "w") as new_log, open(final_log_path, "r") as old_log:
+            shutil.copyfileobj(old_log, new_log)
+        os.remove(final_log_path)
+    else:
+        open(progress_log_path, "w").close()  # Erstelle eine leere Log-Datei
+    
+    return progress_log_path, final_log_path
+
+# Funktion, um das Log umzubenennen
+def finalize_log(progress_log_path, final_log_path):
+    if os.path.exists(progress_log_path):
+        os.rename(progress_log_path, final_log_path)
 
 # ---------------------- Main ----------------------
 def main():
@@ -532,20 +567,40 @@ def main():
     export_dir = config.get("Export", "directory")
     api_url = config.get("API", "url")
     api_token = config.get("API", "token")
-    log_path = config.get("Log", "log_file")
+    log_dir = config.get("Log", "log_file")
 
     headers = {"Authorization": f"Token {api_token}"}
 
-    log_message(log_path, "Starting export...")
+    # Log-Dateien initialisieren
+    progress_log_path, final_log_path = initialize_log(log_dir, script_name)
+    
+    # Logging starten
+    log_message(progress_log_path, "Starting export...")
 
-    tags = fetch_data(api_url, headers, "tags")
-    documents = fetch_data(api_url, headers, "documents")
-    #custom_fields_map = {field["id"]: field for field in fetch_data(api_url, headers, "custom_fields")}
-    custom_fields_map = get_custom_field_definitions(url=api_url,headers=headers)
-    tag_dict = {tag["id"]: tag["name"] for tag in tags}
+    try:
+        tags = fetch_data(api_url, headers, "tags")
+        documents = fetch_data(api_url, headers, "documents")
+        custom_fields_map = get_custom_field_definitions(url=api_url, headers=headers)
+        tag_dict = {tag["id"]: tag["name"] for tag in tags}
 
-    # Neue Funktion aufrufen, die den Export durchführt
-    export_for_tags(tags, export_dir=export_dir,documents=documents, api_url=api_url, headers=headers, custom_fields_map=custom_fields_map, tag_dict=tag_dict, script_name=script_name,log_path=log_path)
+        # Neue Funktion aufrufen, die den Export durchführt
+        export_for_tags(
+            tags,
+            export_dir=export_dir,
+            documents=documents,
+            api_url=api_url,
+            headers=headers,
+            custom_fields_map=custom_fields_map,
+            tag_dict=tag_dict,
+            script_name=script_name,
+            log_path=progress_log_path,
+        )
+    except Exception as e:
+        log_message(progress_log_path, f"Error: {str(e)}")
+        raise
+    finally:
+        # Log umbenennen
+        finalize_log(progress_log_path, final_log_path)
 
 if __name__ == "__main__":
     main()
