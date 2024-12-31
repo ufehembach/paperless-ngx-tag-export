@@ -164,7 +164,7 @@ def export_to_excel(data, file_path, script_name, tag_name, api_url, custom_fiel
     directory = os.path.dirname(file_path)
 
     # Dateiname vorbereiten
-    base_filename = f"export-{tag_name}-{datetime.now().strftime('%Y%m%d')}"
+    base_filename = f"__export-{tag_name}-{datetime.now().strftime('%Y%m%d')}"
     file_ext = ".xlsx"
     filename = f"{base_filename}{file_ext}"
     fullfilename = os.path.join(directory, filename)
@@ -296,7 +296,7 @@ def get_custom_field_definitions(url, headers):
 # ---------------------- Main Export Logic ----------------------
 
 
-def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_fields_map, export_directory, log_file, tag_dict, script_name, is_all_docs=False):
+def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_fields_map, directory, log_file, tag_dict, script_name, is_all_docs=False):
     """Process and export documents by tag or all documents."""
     tag_dir = os.path.join(export_directory, f"{tag_name}")
     os.makedirs(tag_dir, exist_ok=True)
