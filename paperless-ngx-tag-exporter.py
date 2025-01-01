@@ -164,7 +164,7 @@ def export_to_excel(data, file_path, script_name, tag_name, api_url, custom_fiel
     directory = os.path.dirname(file_path)
 
     # Dateiname vorbereiten
-    base_filename = f"__export-{tag_name}-{datetime.now().strftime('%Y%m%d')}"
+    base_filename = f"##export-{tag_name}-{datetime.now().strftime('%Y%m%d')}"
     file_ext = ".xlsx"
     filename = f"{base_filename}{file_ext}"
     fullfilename = os.path.join(directory, filename)
@@ -296,7 +296,7 @@ def get_custom_field_definitions(url, headers):
 # ---------------------- Main Export Logic ----------------------
 
 
-def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_fields_map, directory, log_file, tag_dict, script_name, is_all_docs=False):
+def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_fields_map, export_directory, log_file, tag_dict, script_name, is_all_docs=False):
     """Process and export documents by tag or all documents."""
     tag_dir = os.path.join(export_directory, f"{tag_name}")
     os.makedirs(tag_dir, exist_ok=True)
@@ -340,7 +340,7 @@ def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_f
         export_json(detailed_doc, doc['title'], tag_dir)
         document_data.append(row)
 
-    excel_file = os.path.join(tag_dir, f"__{tag_name}-{datetime.now().strftime('%Y%m%d')}.xlsx")
+    excel_file = os.path.join(tag_dir, f"##{tag_name}-{datetime.now().strftime('%Y%m%d')}.xlsx")
     export_to_excel(document_data, excel_file, script_name, tag_name, api_url=url, custom_fields_map=custom_fields_map, currency_columns=currency_columns)
     log_message(log_file, f"Tag: {tag_name}, Documents exported: {len(document_data)}")
     print(f"Exported Excel file: {excel_file}")
@@ -436,7 +436,7 @@ def prepare_tag_directory_for_export(tag_name, tag_dir):
     # Format der ZIP-Datei: Tagname + Datum
     zip_filename = os.path.join(
         tag_dir,
-        f"__{tag_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        f"##{tag_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     )
     
     # ZIP-Datei erstellen
@@ -527,17 +527,14 @@ def export_for_tags(tags, export_dir, documents, api_url, headers, custom_fields
             # Wenn das Verzeichnis nicht existiert, logge eine Nachricht
             log_message(log_path, f"Verzeichnis für Tag {tag_name} existiert nicht. Export übersprungen.")
 
-import os
-import shutil
-from datetime import datetime
 
 # Funktion, um den Log-Dateinamen basierend auf dem Skriptnamen und Datum zu erstellen
 def get_log_filename(script_name, log_dir, suffix="progress"):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if suffix == "log":
-        return os.path.join(log_dir, f"__{script_name}__{timestamp}.log")
+        return os.path.join(log_dir, f"##{script_name}__{timestamp}.log")
     else:
-        return os.path.join(log_dir, f"__{script_name}__{timestamp}.{suffix}.log")
+        return os.path.join(log_dir, f"##{script_name}__{timestamp}.{suffix}.log")
 
 # Funktion, um Logs zu initialisieren
 def initialize_log(log_dir, script_name):
