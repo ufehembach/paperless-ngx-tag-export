@@ -7,22 +7,22 @@ import requests
 import pandas as pd
 import inspect
 import argparse
+import json
+import locale
+import re
+import zipfile
+
 from configparser import ConfigParser
 from tqdm import tqdm
-import json
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Font, PatternFill
-from openpyxl.formatting.rule import FormulaRule
 from openpyxl.utils.dataframe import dataframe_to_rows
-import locale
-import re
-import zipfile
-from datetime import datetime
+from collections import OrderedDict
+
 
 # Setze das Arbeitsverzeichnis auf das Verzeichnis, in dem das Skript gespeichert ist
 script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -214,11 +214,25 @@ def export_to_excel(data, file_path, script_name, tag_name, api_url, custom_fiel
         # Autofilter
         worksheet.auto_filter.ref = f"A3:{worksheet.cell(row=3, column=len(df.columns)).coordinate}"
 
-        # Datenformatierung mit alternierenden Farben
+        # Definiere die Formate für gerade und ungerade Zeilen
         light_blue_fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
-        formula = "MOD(ROW(),2)=0"
+        white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+        font = Font(name="Arial", size=11)
+
+        # Formeln für gerade und ungerade Zeilen
+        formula_even = "MOD(ROW(),2)=0"
+        formula_odd = "MOD(ROW(),2)<>0"
+
+        # Bereich, der formatiert werden soll
         range_string = f"A4:{worksheet.cell(row=worksheet.max_row, column=len(df.columns)).coordinate}"
-        worksheet.conditional_formatting.add(range_string, FormulaRule([formula], light_blue_fill))
+
+        # Bedingte Formatierung für gerade Zeilen
+        rule_even = FormulaRule(formula=[formula_even], fill=light_blue_fill, font=font)
+        worksheet.conditional_formatting.add(range_string, rule_even)
+
+        # Bedingte Formatierung für ungerade Zeilen
+        rule_odd = FormulaRule(formula=[formula_odd], fill=white_fill, font=font)
+        worksheet.conditional_formatting.add(range_string, rule_odd)
 
         # Hyperlinks in der ID-Spalte
         # Suche die Spalte basierend auf dem Header in Zeile 3
@@ -248,8 +262,6 @@ def export_to_excel(data, file_path, script_name, tag_name, api_url, custom_fiel
 
     print(f"\nExcel-Datei erfolgreich erstellt: {fullfilename}")
  
-
-
 def get_custom_field_definitions(url, headers):
     """Holt die Definitionen für Custom Fields und erzeugt Mappings für Namen, Typ und Auswahloptionen."""
     print_progress(message=f"process custom fields...")
@@ -291,7 +303,23 @@ def get_custom_field_definitions(url, headers):
     return custom_fields_map
 
 
+def has_file_from_today(directory):
+    """
+    Prüft, ob im angegebenen Verzeichnis eine Datei existiert,
+    die heute erstellt oder zuletzt geändert wurde.
+    """
+    today = datetime.now().date()
+    if not os.path.exists(directory):
+        return False
 
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        if os.path.isfile(file_path):
+            # Änderungszeitpunkt der Datei
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+            if file_mtime.date() == today:
+                return True
+    return False
 
 # ---------------------- Main Export Logic ----------------------
 
@@ -299,6 +327,11 @@ def get_custom_field_definitions(url, headers):
 def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_fields_map, export_directory, log_file, tag_dict, script_name, is_all_docs=False):
     """Process and export documents by tag or all documents."""
     tag_dir = os.path.join(export_directory, f"{tag_name}")
+      
+    # Wenn is_all_docs True, prüfe, ob bereits heute ein Export durchgeführt wurde
+    if is_all_docs and has_file_from_today(tag_dir):
+        log_message(log_path=log_file,message=f"Export für alle Dokumente wurde übersprungen, da bereits heute Dateien exportiert wurden.")
+        return
     os.makedirs(tag_dir, exist_ok=True)
 
     document_data = []
@@ -316,25 +349,39 @@ def process_documents_by_tag(documents, tag_name, tag_id, url, headers, custom_f
         custom_fields, doc_currency_columns = process_custom_fields(custom_fields_map, detailed_doc)
         currency_columns.extend(doc_currency_columns)  # Speichere Currency-Felder
 
-        # Dokumentdaten sammeln
-        row = {
-            "ID": doc.get("id"),
-            "Titel": doc.get("title"),
-            "Korrespondent": get_name_from_id(url, headers, "correspondents", doc.get("correspondent")),
-            "Dokumenttyp": get_name_from_id(url, headers, "document_types", doc.get("document_type")),
-            "Speicherpfad": get_name_from_id(url, headers, "storage_paths", doc.get("storage_path")),
-            "Tags": ", ".join(tag_dict.get(tag_id, f"Tag {tag_id}") for tag_id in doc.get("tags", [])),
-            "ArchivDate": parse_date(doc.get("created")),
-            "ModifyDate": parse_date(doc.get("modified")),
-            "AddedDate": parse_date(doc.get("added")),
-            "Tags": ", ".join(tag_dict.get(tag_id, f"Tag {tag_id}") for tag_id in doc.get("tags", [])),
-            **custom_fields,  
-            "OriginalName": doc.get("original_file_name"),
-            "ArchivedName": doc.get("archived_file_name"),
-            "Owner": doc.get("Owner"),
-            "Notes": doc.get("Notes"),
-            "Seiten": doc.get("page_count"),
-        }
+       # Dokumentdaten sammeln
+        row = OrderedDict([
+            ("ID", doc.get("id")),
+            ("AddDateFull", format_date(parse_date(doc.get("added")), "yyyy-mm-dd")),
+            ("Korrespondent", get_name_from_id(url, headers, "correspondents", doc.get("correspondent"))),
+            ("Titel", doc.get("title")),
+            ("Tags", ", ".join(tag_dict.get(tag_id, f"Tag {tag_id}") for tag_id in doc.get("tags", []))),
+
+            # Custom Fields direkt hinter den Tags einfügen
+            *custom_fields.items(),  
+
+            ("ArchivDate", parse_date(doc.get("created"))),
+            ("ArchivedDateMonth", format_date(parse_date(doc.get("created")), "yyyy-mm")),
+            ("ArchivedDateFull", format_date(parse_date(doc.get("created")), "yyyy-mm-dd")),
+
+            ("ModifyDate", parse_date(doc.get("modified"))),
+            ("ModifyDateMonth", format_date(parse_date(doc.get("modified")), "yyyy-mm")),
+            ("ModifyDateFull", format_date(parse_date(doc.get("modified")), "yyyy-mm-dd")),
+
+            ("AddedDate", parse_date(doc.get("added"))),
+            ("AddDateMonth", format_date(parse_date(doc.get("added")), "yyyy-mm")),
+            ("AddDateFull", format_date(parse_date(doc.get("added")), "yyyy-mm-dd")),
+
+            ("Seiten", doc.get("page_count")),
+            ("Dokumenttyp", get_name_from_id(url, headers, "document_types", doc.get("document_type"))),
+            ("Speicherpfad", get_name_from_id(url, headers, "storage_paths", doc.get("storage_path"))),
+            ("OriginalName", doc.get("original_file_name")),
+            ("ArchivedName", doc.get("archived_file_name")),
+            ("Owner", doc.get("Owner")),
+            ("Notes", doc.get("Notes")),
+        ])
+
+        document_data.append(row) 
 
         export_pdf(doc['id'], doc['title'], tag_dir, url, headers)
         export_json(detailed_doc, doc['title'], tag_dir)
@@ -403,28 +450,68 @@ def format_currency(value, currency_locale="de_DE.UTF-8"):
     formatted_value = locale.currency(value_float, grouping=True)
     return formatted_value
 
+from datetime import datetime
+from dateutil import parser
+
+def format_date(date_string, output_format):
+    """
+    Formatiert das Datum im Format '%d.%m.%Y' oder '%d.%m.%Y %H:%M' 
+    in das gewünschte Format:
+    - 'yyyy-mm' oder
+    - 'yyyy-mm-dd'.
+    
+    Parameter:
+    - date_string: Das Datum als String (im Format '%d.%m.%Y' oder '%d.%m.%Y %H:%M').
+    - output_format: Das gewünschte Ausgabeformat ('yyyy-mm' oder 'yyyy-mm-dd').
+    
+    Rückgabe:
+    - Das Datum im gewünschten Format als String oder None bei Fehlern.
+    """
+    if not date_string:
+        print(f"Date string is empty or None: {date_string}")
+        return None
+
+    try:
+        # Datum im ursprünglichen Format parsen
+        if len(date_string.split(" ")) > 1:
+            parsed_date = datetime.strptime(date_string, "%d.%m.%Y %H:%M")
+        else:
+            parsed_date = datetime.strptime(date_string, "%d.%m.%Y")
+        
+        # Rückgabe im gewünschten Format
+        if output_format == "yyyy-mm":
+            return parsed_date.strftime("%Y-%m")
+        elif output_format == "yyyy-mm-dd":
+            return parsed_date.strftime("%Y-%m-%d")
+        else:
+            print(f"Unsupported output format: {output_format}")
+            return None
+    except Exception as e:
+        print(f"Failed to format date '{date_string}': {e}")
+        return None
 
 def parse_date(date_string):
     """
     Versucht, das Datum mit oder ohne Zeitzonen-Offset zu parsen.
-    Gibt das Datum im Format '%d.%m.%Y' zurück oder None, wenn das Parsing fehlschlägt.
+    Gibt das Datum im Format '%d.%m.%Y' zurück, wenn die Uhrzeit 00:00 ist,
+    andernfalls im Format '%d.%m.%Y %H:%M'.
     """
-    if date_string:
-        try:
-            # Versuche, das Datum mit Zeitzonen-Offset zu parsen
-            parsed_date = datetime.strptime(date_string, "%Y-%m-%dT%H:%M:%S%z")
-        except ValueError:
-            try:
-                # Falls das Datum keinen Zeitzonen-Offset hat, versuche es im UTC-Format
-                parsed_date = datetime.strptime(date_string, "%Y-%m-%dT%H:%M:%SZ")
-            except ValueError:
-                # Wenn das Datum in keinem der Formate geparst werden kann, gib None zurück
-                parsed_date = None
+    if not date_string:
+        print(f"Date string is empty or None: {date_string}")
+        return None
+
+    try:
+        # Verwende dateutil.parser, um flexibel zu parsen
+        parsed_date = parser.isoparse(date_string)
         
-        # Wenn das Datum erfolgreich geparst wurde, formatiere es und gib es zurück
-        if parsed_date:
+        # Prüfe, ob die Uhrzeit 00:00 ist
+        if parsed_date.hour == 0 and parsed_date.minute == 0:
             return parsed_date.strftime("%d.%m.%Y")
-    return None
+        else:
+            return parsed_date.strftime("%d.%m.%Y %H:%M")
+    except Exception as e:
+        print(f"Failed to parse date '{date_string}': {e}")
+        return None
 
 def prepare_tag_directory_for_export(tag_name, tag_dir):
     """
